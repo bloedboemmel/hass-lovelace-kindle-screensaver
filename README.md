@@ -14,6 +14,8 @@ If you're looking for a way to render your own HTML, see my other project [hass-
 
 This tool regularly takes a screenshot of a specific page of your home assistant setup. It converts it into the PNG/JPEG grayscale format which Kindles can display.
 
+**Energy-Efficient Image Updates:** The tool intelligently compares each new screenshot with the previous one and only updates the image file when changes are detected. This helps save energy on e-ink displays by avoiding unnecessary screen refreshes. A JSON metadata file is also generated to track when images were last modified and checked.
+
 Using my [own Kindle 4 setup guide](https://github.com/sibbl/hass-lovelace-kindle-4) or the [online screensaver extension](https://www.mobileread.com/forums/showthread.php?t=236104) for any jailbroken Kindle, this image can be regularly polled from your device so you can use it as a weather station, a display for next public transport departures etc.
 
 ## Usage
@@ -26,6 +28,27 @@ I recommend simply using the `docker-compose.yml` file inside this repository, c
 Additionally, you can then later use `docker-compose pull && docker-compose up -d` to update the image in case you want to update it.
 
 You can then access the image by doing a simple GET request to e.g. `http://localhost:5000/` to receive the most recent image (might take up to 60s after the first run).
+
+### Checking for Image Updates (JSON Metadata)
+
+To save energy on e-ink displays, you can check if an image has been updated before downloading it. The tool provides a JSON metadata endpoint for each page:
+
+- `http://localhost:5000/.json` - Metadata for page 1
+- `http://localhost:5000/2.json` - Metadata for page 2
+- `http://localhost:5000/3.json` - Metadata for page 3
+
+The JSON response contains:
+```json
+{
+  "lastModified": "2026-02-02T13:23:14.606Z",
+  "lastChecked": "2026-02-02T13:23:14.606Z"
+}
+```
+
+- `lastModified`: Timestamp when the image was last changed (null if never changed)
+- `lastChecked`: Timestamp when the screenshot was last taken
+
+Your e-ink display can check this endpoint before downloading the image. If `lastModified` hasn't changed since the last check, skip downloading the image to save energy and bandwidth.
 
 Home Assistant related stuff:
 
