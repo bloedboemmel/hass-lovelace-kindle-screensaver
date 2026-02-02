@@ -264,7 +264,7 @@ async function renderAndConvertAsync(browser) {
       const newHash = await getFileHash(finalTempPath);
       const existingHash = await getFileHash(outputPath);
       
-      if (newHash === existingHash) {
+      if (newHash && existingHash && newHash === existingHash) {
         hasChanged = false;
         console.log(`Image unchanged for ${url}, skipping update`);
       } else {
