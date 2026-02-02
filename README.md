@@ -141,3 +141,45 @@ Some advanced variables for local usage which shouldn't be necessary when using 
 - `PORT=5000` (port of server, which returns the last image)
 - `USE_IMAGE_MAGICK=false` (use ImageMagick instead of GraphicsMagick)
 - `UNSAFE_IGNORE_CERTIFICATE_ERRORS=true` (ignore certificate errors of e.g. self-signed certificates at your own risk)
+
+## Development
+
+### Publishing to Custom Registry
+
+This repository includes a GitHub Actions workflow (`custom-registry.yml`) that allows you to push Docker images to your own container registry. This is useful if you want to maintain your own fork with custom modifications.
+
+#### Setup
+
+To use the custom registry workflow, you need to configure the following repository secrets in your GitHub repository settings:
+
+**For Docker Hub:**
+- `CUSTOM_REGISTRY_URL` - Leave empty or set to `docker.io`
+- `CUSTOM_REGISTRY_USERNAME` - Your Docker Hub username
+- `CUSTOM_REGISTRY_TOKEN` - Your Docker Hub access token
+- `CUSTOM_REGISTRY_PREFIX` - Your Docker Hub username (e.g., `yourusername`)
+
+**For GitHub Container Registry (GHCR):**
+- `CUSTOM_REGISTRY_URL` - Set to `ghcr.io`
+- `CUSTOM_REGISTRY_USERNAME` - Your GitHub username
+- `CUSTOM_REGISTRY_TOKEN` - GitHub Personal Access Token with `write:packages` permission
+- `CUSTOM_REGISTRY_PREFIX` - Set to `ghcr.io/yourusername` (lowercase)
+
+**For other registries (e.g., AWS ECR, Google Container Registry):**
+- `CUSTOM_REGISTRY_URL` - Your registry URL (e.g., `123456789.dkr.ecr.us-east-1.amazonaws.com`)
+- `CUSTOM_REGISTRY_USERNAME` - Registry username
+- `CUSTOM_REGISTRY_TOKEN` - Registry access token/password
+- `CUSTOM_REGISTRY_PREFIX` - Your registry prefix (e.g., `123456789.dkr.ecr.us-east-1.amazonaws.com/yourname`)
+
+#### Triggering the Workflow
+
+The workflow runs automatically when you push a tag matching the pattern `v*.*.*` (e.g., `v1.0.0`). You can also trigger it manually from the Actions tab in GitHub.
+
+The workflow builds and pushes the following images:
+- Main application image for multiple architectures (amd64, arm/v7, arm64)
+- Home Assistant Addon images for amd64, aarch64, and armv7
+
+Example images pushed to your registry:
+- `yourusername/hass-lovelace-kindle-screensaver:latest`
+- `yourusername/hass-lovelace-kindle-screensaver:1.0.15`
+- `yourusername/hass-lovelace-kindle-screensaver-ha-addon-amd64:latest`
+- And more...
