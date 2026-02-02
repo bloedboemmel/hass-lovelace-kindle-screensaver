@@ -133,7 +133,7 @@ async function updateMetadataJson(outputPath, hasChanged) {
     const pathWithoutExtension = isJsonRequest ? pageNumberStr.slice(0, -5) : pageNumberStr;
     
     const pageNumber =
-      pathWithoutExtension === "/" ? 1 : parseInt(pathWithoutExtension.substr(1));
+      pathWithoutExtension === "/" ? 1 : parseInt(pathWithoutExtension.substring(1));
     if (
       isFinite(pageNumber) === false ||
       pageNumber > config.pages.length ||
