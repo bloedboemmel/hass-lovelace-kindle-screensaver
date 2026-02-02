@@ -18,11 +18,13 @@ jobs:
         run: node -p -e '`PACKAGE_VERSION=${require("./package.json").version}`' >> $GITHUB_ENV
       
       - name: Set registry prefix
+        env:
+          CUSTOM_PREFIX: ${{ secrets.CUSTOM_REGISTRY_PREFIX }}
         run: |
-          if [ -z "${{ secrets.CUSTOM_REGISTRY_PREFIX }}" ]; then
+          if [ -z "$CUSTOM_PREFIX" ]; then
             echo "REGISTRY_PREFIX=hass-lovelace-kindle-screensaver" >> $GITHUB_ENV
           else
-            echo "REGISTRY_PREFIX=${{ secrets.CUSTOM_REGISTRY_PREFIX }}/hass-lovelace-kindle-screensaver" >> $GITHUB_ENV
+            echo "REGISTRY_PREFIX=${CUSTOM_PREFIX}/hass-lovelace-kindle-screensaver" >> $GITHUB_ENV
           fi
       
       - name: Set up QEMU
