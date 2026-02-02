@@ -420,6 +420,11 @@ function convertImageToKindleCompatiblePngAsync(
       gmInstance = gmInstance.quality(100);
     }
     
+    // Strip metadata to ensure deterministic output
+    // This removes timestamps and other variable metadata that would cause
+    // identical images to have different file hashes
+    gmInstance = gmInstance.strip();
+    
     gmInstance.write(outputPath, (err) => {
       if (err) {
         reject(err);
