@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+* Updated `custom-registry.yml` workflow to use GitHub Container Registry (ghcr.io) instead of custom Docker registry
+* Removed dependency on custom registry secrets (CUSTOM_REGISTRY_URL, CUSTOM_REGISTRY_USERNAME, CUSTOM_REGISTRY_TOKEN, CUSTOM_REGISTRY_PREFIX)
+* Registry now automatically configured as `ghcr.io/{owner}/hass-lovelace-kindle-screensaver`
+
 ## 1.0.15
 
 ### Added
