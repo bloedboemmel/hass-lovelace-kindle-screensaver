@@ -7,9 +7,50 @@ const fsExtra = require("fs-extra");
 const puppeteer = require("puppeteer");
 const { CronJob } = require("cron");
 const gm = require("gm");
+const crypto = require("crypto");
 
 // keep state of current battery level and whether the device is charging
 const batteryStore = {};
+
+// Helper function to calculate file hash
+async function getFileHash(filePath) {
+  try {
+    const fileBuffer = await fs.readFile(filePath);
+    const hashSum = crypto.createHash('sha256');
+    hashSum.update(fileBuffer);
+    return hashSum.digest('hex');
+  } catch (error) {
+    return null;
+  }
+}
+
+// Helper function to update metadata JSON
+async function updateMetadataJson(outputPath, hasChanged) {
+  const metadataPath = outputPath + ".json";
+  let metadata = {
+    lastModified: null,
+    lastChecked: new Date().toISOString()
+  };
+  
+  // Try to read existing metadata
+  try {
+    const existingData = await fs.readFile(metadataPath, 'utf8');
+    metadata = JSON.parse(existingData);
+  } catch (error) {
+    // File doesn't exist or is invalid, will create new one
+  }
+  
+  // Update lastChecked always
+  metadata.lastChecked = new Date().toISOString();
+  
+  // Update lastModified only if image changed
+  if (hasChanged) {
+    metadata.lastModified = new Date().toISOString();
+  }
+  
+  await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
+  return metadata;
+}
 
 (async () => {
   if (config.pages.length === 0) {
@@ -86,8 +127,13 @@ const batteryStore = {};
     // (see https://github.com/sibbl/hass-lovelace-kindle-screensaver/README.md for patch to generate it on Kindle)
     const batteryLevel = parseInt(url.searchParams.get("batteryLevel"));
     const isCharging = url.searchParams.get("isCharging");
+    
+    // Handle JSON metadata requests
+    const isJsonRequest = pageNumberStr.endsWith('.json');
+    const pathWithoutExtension = isJsonRequest ? pageNumberStr.slice(0, -5) : pageNumberStr;
+    
     const pageNumber =
-      pageNumberStr === "/" ? 1 : parseInt(pageNumberStr.substr(1));
+      pathWithoutExtension === "/" ? 1 : parseInt(pathWithoutExtension.substring(1));
     if (
       isFinite(pageNumber) === false ||
       pageNumber > config.pages.length ||
@@ -101,10 +147,35 @@ const batteryStore = {};
     try {
       // Log when the page was accessed
       const n = new Date();
-      console.log(`${n.toISOString()}: Image ${pageNumber} was accessed`);
+      console.log(`${n.toISOString()}: ${isJsonRequest ? 'Metadata' : 'Image'} ${pageNumber} was accessed`);
 
       const pageIndex = pageNumber - 1;
       const configPage = config.pages[pageIndex];
+
+      if (isJsonRequest) {
+        // Serve JSON metadata
+        const metadataPath = configPage.outputPath + "." + configPage.imageFormat + ".json";
+        try {
+          const metadataContent = await fs.readFile(metadataPath, 'utf8');
+          response.writeHead(200, {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(metadataContent)
+          });
+          response.end(metadataContent);
+        } catch (e) {
+          // Metadata file doesn't exist, return default
+          const defaultMetadata = JSON.stringify({
+            lastModified: null,
+            lastChecked: null
+          });
+          response.writeHead(200, {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(defaultMetadata)
+          });
+          response.end(defaultMetadata);
+        }
+        return;
+      }
 
       const outputPathWithExtension = configPage.outputPath + "." + configPage.imageFormat
       const data = await fs.readFile(outputPathWithExtension);
@@ -179,13 +250,41 @@ async function renderAndConvertAsync(browser) {
       return;
     } 
     console.log(`Converting rendered screenshot of ${url} to grayscale...`);
+    
+    const finalTempPath = outputPath + ".final.temp";
     await convertImageToKindleCompatiblePngAsync(
       pageConfig,
       tempPath,
-      outputPath
+      finalTempPath
     );
 
-    fs.unlink(tempPath);
+    // Compare with existing image
+    let hasChanged = true;
+    if (await fsExtra.pathExists(outputPath)) {
+      const newHash = await getFileHash(finalTempPath);
+      const existingHash = await getFileHash(outputPath);
+      
+      if (newHash && existingHash && newHash === existingHash) {
+        hasChanged = false;
+        console.log(`Image unchanged for ${url}, skipping update`);
+      } else {
+        console.log(`Image changed for ${url}, updating`);
+      }
+    } else {
+      console.log(`First render for ${url}, creating image`);
+    }
+
+    // Only update the output file if image has changed
+    if (hasChanged) {
+      await fsExtra.move(finalTempPath, outputPath, { overwrite: true });
+    } else {
+      await fs.unlink(finalTempPath);
+    }
+    
+    // Update metadata JSON
+    await updateMetadataJson(outputPath, hasChanged);
+
+    await fs.unlink(tempPath);
     console.log(`Finished ${url}`);
 
     if (
