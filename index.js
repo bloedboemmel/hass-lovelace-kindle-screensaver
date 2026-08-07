@@ -1,3 +1,4 @@
+require("dotenv").config();
 const config = require("./config");
 const path = require("path");
 const http = require("http");
@@ -5,57 +6,77 @@ const https = require("https");
 const { promises: fs } = require("fs");
 const fsExtra = require("fs-extra");
 const puppeteer = require("puppeteer");
-const { CronJob } = require("cron");
+const { CronJob, CronTime } = require("cron");
 const gm = require("gm");
 const crypto = require("crypto");
+const { shouldReturnNotModified } = require("./http-cache");
+const {
+  getGraphicsMagickFormat,
+  resolveFinalTempPath,
+  resolveOutputPath,
+  resolveScreenshotTempPath
+} = require("./image-output");
+const {
+  withTimeout
+} = require("./operation-timeout");
+const { RenderCoordinator } = require("./render-coordinator");
 
 // keep state of current battery level and whether the device is charging
 const batteryStore = {};
+const metadataStore = {};
 
 // Helper function to calculate file hash
 async function getFileHash(filePath) {
   try {
     const fileBuffer = await fs.readFile(filePath);
-    const hashSum = crypto.createHash('sha256');
-    hashSum.update(fileBuffer);
-    return hashSum.digest('hex');
+    return crypto.createHash('sha256').update(fileBuffer).digest('hex');
   } catch (error) {
     return null;
   }
-}
-
-// Helper function to update metadata JSON
-async function updateMetadataJson(outputPath, hasChanged) {
-  const metadataPath = outputPath + ".json";
-  let metadata = {
-    lastModified: null,
-    lastChecked: new Date().toISOString()
-  };
-  
-  // Try to read existing metadata
-  try {
-    const existingData = await fs.readFile(metadataPath, 'utf8');
-    metadata = JSON.parse(existingData);
-  } catch (error) {
-    // File doesn't exist or is invalid, will create new one
-  }
-  
-  // Update lastChecked always
-  metadata.lastChecked = new Date().toISOString();
-  
-  // Update lastModified only if image changed
-  if (hasChanged) {
-    metadata.lastModified = new Date().toISOString();
-  }
-  
-  await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
-  return metadata;
 }
 
 (async () => {
   if (config.pages.length === 0) {
     return console.error("Please check your configuration");
   }
+  
+  // Validate HA_BASE_URL is not the default placeholder
+  if (!config.baseUrl || config.baseUrl.trim() === '') {
+    console.error("ERROR: HA_BASE_URL is not configured.");
+    console.error("Please set HA_BASE_URL to your Home Assistant instance URL.");
+    return console.error("Example: https://homeassistant.local:8123 or http://192.168.1.100:8123");
+  }
+  
+  // Check for common placeholder values
+  const placeholderPatterns = [
+    'your-path-to-home-assistant',
+    'your-hass-instance',
+    'your-home-assistant',
+    'example.com'
+  ];
+  
+  const baseUrlLower = config.baseUrl.toLowerCase();
+  for (const pattern of placeholderPatterns) {
+    if (baseUrlLower.includes(pattern)) {
+      console.error(`ERROR: HA_BASE_URL contains placeholder text: "${config.baseUrl}"`);
+      console.error("Please update HA_BASE_URL to your actual Home Assistant instance URL.");
+      console.error("Examples:");
+      console.error("  - https://homeassistant.local:8123");
+      console.error("  - http://192.168.1.100:8123");
+      return console.error("  - https://my-home.duckdns.org:8123");
+    }
+  }
+  
+  // Validate HA_ACCESS_TOKEN is provided
+  if (!config.accessToken || config.accessToken.trim() === '') {
+    console.error("ERROR: HA_ACCESS_TOKEN is not configured.");
+    console.error("Please create a long-lived access token in Home Assistant:");
+    console.error("  1. Go to your Home Assistant profile");
+    console.error("  2. Scroll down to 'Long-Lived Access Tokens'");
+    console.error("  3. Click 'Create Token'");
+    return console.error("  4. Copy the token and set it as HA_ACCESS_TOKEN");
+  }
+  
   for (const i in config.pages) {
     const pageConfig = config.pages[i];
     if (pageConfig.rotation % 90 > 0) {
@@ -65,75 +86,224 @@ async function updateMetadataJson(outputPath, hasChanged) {
     }
   }
 
-  console.log("Starting browser...");
-  let browser = await puppeteer.launch({
-    args: [
-      "--disable-dev-shm-usage",
-      "--no-sandbox",
-      `--lang=${config.language}`,
-      config.ignoreCertificateErrors && "--ignore-certificate-errors"
-    ].filter((x) => x),
-    defaultViewport: null,
-    timeout: config.browserLaunchTimeout,
-    headless: config.debug !== true
-  });
+  // --- Start HTTP server IMMEDIATELY (before browser/render setup) ---
+  // This ensures the Kindle always gets the last good image,
+  // even if HA is temporarily unreachable during startup.
+  console.log("Starting HTTP server...");
 
-  console.log(`Visiting '${config.baseUrl}' to login...`);
-  let page = await browser.newPage();
-  await page.goto(config.baseUrl, {
-    timeout: config.renderingTimeout
-  });
+  let initInProgress = false;
+  let browser = null;
+  let browserStartedAt = null;
+  const appStartedAt = Date.now();
+  let lastSuccessfulRenderAt = null;
 
-  const hassTokens = {
-    hassUrl: config.baseUrl,
-    access_token: config.accessToken,
-    token_type: "Bearer"
+  const renderJobTimeout = getRenderJobTimeout();
+  const healthcheckMaxAge = getHealthcheckMaxAge(renderJobTimeout);
+
+  const closeCurrentBrowser = async (reason) => {
+    if (!browser) {
+      return;
+    }
+
+    const browserToClose = browser;
+    browser = null;
+    browserStartedAt = null;
+    console.error(`Closing browser after ${reason}`);
+    await closeBrowser(browserToClose, reason);
   };
 
-  console.log("Adding authentication entry to browser's local storage...");
-  await page.evaluate(
-    (hassTokens, selectedLanguage) => {
-      localStorage.setItem("hassTokens", hassTokens);
-      localStorage.setItem("selectedLanguage", selectedLanguage);
-    },
-    JSON.stringify(hassTokens),
-    JSON.stringify(config.language)
-  );
-
-  page.close();
-
-  if (config.debug) {
-    console.log(
-      "Debug mode active, will only render once in non-headless model and keep page open"
+  const isBrowserCacheExpired = () => {
+    return (
+      config.browserCacheTtl > 0 &&
+      browserStartedAt !== null &&
+      Date.now() - browserStartedAt >= config.browserCacheTtl
     );
-    renderAndConvertAsync(browser);
-  } else {
-    console.log("Starting first render...");
-    await renderAndConvertAsync(browser);
-    console.log("Starting rendering cronjob...");
-    new CronJob({
-      cronTime: config.cronJob,
-      onTick: () => renderAndConvertAsync(browser),
-      start: true
-    });
+  };
+
+  const ensureBrowser = async ({ resetBrowserCache = false } = {}) => {
+    if (resetBrowserCache) {
+      await closeCurrentBrowser("browser cache reset request");
+    } else if (isBrowserCacheExpired()) {
+      await closeCurrentBrowser("browser cache TTL expiry");
+    }
+
+    if (!browser) {
+      await initBrowser();
+      if (!browser) {
+        throw new Error("Browser not ready after init attempt");
+      }
+    }
+
+    return browser;
+  };
+
+  const renderCoordinator = new RenderCoordinator({
+    renderJobTimeout,
+    ensureBrowser,
+    closeBrowser: closeCurrentBrowser,
+    onSuccess: () => {
+      lastSuccessfulRenderAt = Date.now();
+    }
+  });
+
+  const safeRender = () => {
+    return renderCoordinator.run(
+      "scheduled render job",
+      (currentBrowser) => renderAndConvertAsync(currentBrowser),
+      { skipIfBusy: true }
+    );
+  };
+
+  const requestRender = (pageNumber, { resetBrowserCache = false } = {}) => {
+    if (pageNumber) {
+      const pageIndex = pageNumber - 1;
+      return renderCoordinator.run(
+        `requested render for image ${pageNumber}`,
+        (currentBrowser) => renderPageAndConvertAsync(currentBrowser, pageIndex),
+        {
+          resetBrowserCache,
+          updateLastSuccessfulRender: false
+        }
+      );
+    }
+
+    return renderCoordinator.run(
+      "requested render for all images",
+      (currentBrowser) => renderAndConvertAsync(currentBrowser),
+      { resetBrowserCache }
+    );
+  };
+
+  const clearBrowserCache = () => {
+    return renderCoordinator.run(
+      "browser cache clear",
+      () => Promise.resolve(),
+      {
+        resetBrowserCache: true,
+        updateLastSuccessfulRender: false
+      }
+    );
+  };
+
+  const requireAuth = config.httpAuthUser && config.httpAuthPassword;
+  if (requireAuth) {
+    console.log("Basic auth enabled for HTTP server");
   }
 
   const httpServer = http.createServer(async (request, response) => {
     // Parse the request
     const url = new URL(request.url, `http://${request.headers.host}`);
+
+    if (url.pathname === "/health") {
+      const now = Date.now();
+      const age = lastSuccessfulRenderAt ? now - lastSuccessfulRenderAt : null;
+      const startupAge = now - appStartedAt;
+      const renderState = renderCoordinator.getState(now);
+      const isHealthy =
+        lastSuccessfulRenderAt !== null
+          ? age <= healthcheckMaxAge
+          : startupAge <= healthcheckMaxAge;
+
+      const payload = JSON.stringify({
+        status: isHealthy ? "ok" : "stale",
+        renderInProgress: renderState.renderInProgress,
+        renderInProgressFor: renderState.renderInProgressFor,
+        lastSuccessfulRenderAt: lastSuccessfulRenderAt
+          ? new Date(lastSuccessfulRenderAt).toISOString()
+          : null,
+        lastSuccessfulRenderAge: age,
+        maxAge: healthcheckMaxAge
+      });
+
+      response.writeHead(isHealthy ? 200 : 503, {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload),
+        "Cache-Control": "no-cache"
+      });
+      response.end(payload);
+      return;
+    }
+
+    // Check basic auth if configured
+    if (requireAuth) {
+      const authHeader = request.headers.authorization;
+      if (!authHeader || !authHeader.startsWith("Basic ")) {
+        response.writeHead(401, { "WWW-Authenticate": 'Basic realm="hass-lovelace-kindle-screensaver"' });
+        response.end("Unauthorized");
+        return;
+      }
+      const credentials = Buffer.from(authHeader.slice(6), "base64").toString();
+      const [user, ...passwordParts] = credentials.split(":");
+      const password = passwordParts.join(":");
+      if (user !== config.httpAuthUser || password !== config.httpAuthPassword) {
+        response.writeHead(401, { "WWW-Authenticate": 'Basic realm="hass-lovelace-kindle-screensaver"' });
+        response.end("Unauthorized");
+        return;
+      }
+    }
+
+    if (url.pathname === "/render" || url.pathname.startsWith("/render/")) {
+      if (request.method !== "POST") {
+        response.writeHead(405, { "Allow": "POST" });
+        response.end("Method Not Allowed");
+        return;
+      }
+
+      const renderTarget = parseRenderTarget(url.pathname);
+      if (
+        renderTarget === null ||
+        renderTarget.pageNumber > config.pages.length
+      ) {
+        response.writeHead(400);
+        response.end("Invalid render target");
+        return;
+      }
+
+      const renderResult = await requestRender(renderTarget.pageNumber, {
+        resetBrowserCache: hasTruthyFlag(url.searchParams, "clearCache")
+      });
+      writeJsonResponse(
+        response,
+        renderResult.status === "ok" ? 200 : 503,
+        renderResult
+      );
+      return;
+    }
+
+    if (url.pathname === "/cache/clear") {
+      if (request.method !== "POST") {
+        response.writeHead(405, { "Allow": "POST" });
+        response.end("Method Not Allowed");
+        return;
+      }
+
+      const cacheClearResult = await clearBrowserCache();
+      writeJsonResponse(
+        response,
+        cacheClearResult.status === "ok" ? 200 : 503,
+        cacheClearResult
+      );
+      return;
+    }
+
     // Check the page number
     const pageNumberStr = url.pathname;
+    const isJsonRequest = pageNumberStr.endsWith(".json");
+    const normalizedPagePath = isJsonRequest
+      ? pageNumberStr.substring(0, pageNumberStr.length - 5)
+      : pageNumberStr;
     // and get the battery level, if any
     // (see https://github.com/sibbl/hass-lovelace-kindle-screensaver/README.md for patch to generate it on Kindle)
     const batteryLevel = parseInt(url.searchParams.get("batteryLevel"));
     const isCharging = url.searchParams.get("isCharging");
-    
-    // Handle JSON metadata requests
-    const isJsonRequest = pageNumberStr.endsWith('.json');
-    const pathWithoutExtension = isJsonRequest ? pageNumberStr.slice(0, -5) : pageNumberStr;
-    
     const pageNumber =
-      pathWithoutExtension === "/" ? 1 : parseInt(pathWithoutExtension.substring(1));
+      normalizedPagePath === "/" || normalizedPagePath === ""
+        ? 1
+        : parseInt(normalizedPagePath.substr(1));
+    const refreshRequested =
+      hasTruthyFlag(url.searchParams, "refresh") ||
+      hasTruthyFlag(url.searchParams, "forceRefresh");
+    const cacheClearRequested = hasTruthyFlag(url.searchParams, "clearCache");
     if (
       isFinite(pageNumber) === false ||
       pageNumber > config.pages.length ||
@@ -144,83 +314,83 @@ async function updateMetadataJson(outputPath, hasChanged) {
       response.end("Invalid request");
       return;
     }
+
+    const pageIndex = pageNumber - 1;
+    if (!isJsonRequest) {
+      updateBatteryStore(pageIndex, pageNumber, batteryLevel, isCharging);
+    }
+
+    let renderResult = null;
+    let cacheClearResult = null;
+    if (refreshRequested) {
+      console.log(`Refresh requested for image ${pageNumber}`);
+      renderResult = await requestRender(pageNumber, {
+        resetBrowserCache: cacheClearRequested
+      });
+    } else if (cacheClearRequested) {
+      console.log("Browser cache clear requested");
+      cacheClearResult = await clearBrowserCache();
+    }
+
     try {
       // Log when the page was accessed
       const n = new Date();
-      console.log(`${n.toISOString()}: ${isJsonRequest ? 'Metadata' : 'Image'} ${pageNumber} was accessed`);
+      console.log(`${n.toISOString()}: Image ${pageNumber} was accessed (${request.method})`);
 
-      const pageIndex = pageNumber - 1;
       const configPage = config.pages[pageIndex];
 
+      const outputPathWithExtension = resolveOutputPath(configPage);
+
       if (isJsonRequest) {
-        // Serve JSON metadata
-        const metadataPath = configPage.outputPath + "." + configPage.imageFormat + ".json";
-        try {
-          const metadataContent = await fs.readFile(metadataPath, 'utf8');
-          response.writeHead(200, {
-            "Content-Type": "application/json",
-            "Content-Length": Buffer.byteLength(metadataContent)
-          });
-          response.end(metadataContent);
-        } catch (e) {
-          // Metadata file doesn't exist, return default
-          const defaultMetadata = JSON.stringify({
-            lastModified: null,
-            lastChecked: null
-          });
-          response.writeHead(200, {
-            "Content-Type": "application/json",
-            "Content-Length": Buffer.byteLength(defaultMetadata)
-          });
-          response.end(defaultMetadata);
-        }
+        writeJsonResponse(
+          response,
+          200,
+          await getImageMetadata(pageIndex, outputPathWithExtension)
+        );
         return;
       }
 
-      const outputPathWithExtension = configPage.outputPath + "." + configPage.imageFormat
       const data = await fs.readFile(outputPathWithExtension);
       const stat = await fs.stat(outputPathWithExtension);
 
       const lastModifiedTime = new Date(stat.mtime).toUTCString();
+      const etag = crypto.createHash('sha256').update(data).digest('hex');
+      const quotedEtag = `"${etag}"`;
 
-      response.writeHead(200, {
+      const headers = {
         "Content-Type": "image/" + configPage.imageFormat,
         "Content-Length": Buffer.byteLength(data),
-        "Last-Modified": lastModifiedTime
-      });
-      response.end(data);
+        "Last-Modified": lastModifiedTime,
+        "ETag": quotedEtag,
+        "Cache-Control": "no-cache",
+        ...getOperationHeaders(renderResult, cacheClearResult)
+      };
 
-      let pageBatteryStore = batteryStore[pageIndex];
-      if (!pageBatteryStore) {
-        pageBatteryStore = batteryStore[pageIndex] = {
-          batteryLevel: null,
-          isCharging: false
-        };
+      const operationFailed =
+        (renderResult && renderResult.status === "failed") ||
+        (cacheClearResult && cacheClearResult.status === "failed");
+      if (
+        !operationFailed &&
+        shouldReturnNotModified(request.headers, quotedEtag, stat.mtimeMs)
+      ) {
+        const notModifiedHeaders = { ...headers };
+        delete notModifiedHeaders["Content-Length"];
+        response.writeHead(304, notModifiedHeaders);
+        response.end();
+        return;
       }
-      if (!isNaN(batteryLevel) && batteryLevel >= 0 && batteryLevel <= 100) {
-        if (batteryLevel !== pageBatteryStore.batteryLevel) {
-          pageBatteryStore.batteryLevel = batteryLevel;
-          console.log(
-            `New battery level: ${batteryLevel} for page ${pageNumber}`
-          );
-        }
 
-        if (
-          (isCharging === "Yes" || isCharging === "1") &&
-          pageBatteryStore.isCharging !== true) {
-          pageBatteryStore.isCharging = true;
-          console.log(`Battery started charging for page ${pageNumber}`);
-        } else if (
-          (isCharging === "No" || isCharging === "0") &&
-          pageBatteryStore.isCharging !== false
-        ) {
-          console.log(`Battery stopped charging for page ${pageNumber}`);
-          pageBatteryStore.isCharging = false;
-        }
+      // Support HEAD requests — return headers only, no body
+      if (request.method === "HEAD") {
+        response.writeHead(200, headers);
+        response.end();
+      } else {
+        response.writeHead(200, headers);
+        response.end(data);
       }
     } catch (e) {
       console.error(e);
-      response.writeHead(404);
+      response.writeHead(404, getOperationHeaders(renderResult, cacheClearResult));
       response.end("Image not found");
     }
   });
@@ -229,41 +399,175 @@ async function updateMetadataJson(outputPath, hasChanged) {
   httpServer.listen(port, () => {
     console.log(`Server is running at ${port}`);
   });
+
+  // --- Initialize browser and HA auth (non-blocking for HTTP) ---
+  // If this fails, the HTTP server keeps serving the last good image.
+  const initBrowser = async () => {
+    if (browser) {
+      return browser;
+    }
+    if (initInProgress) {
+      console.log("Browser init already in progress, skipping init attempt");
+      return null;
+    }
+
+    initInProgress = true;
+    let nextBrowser = null;
+    let page = null;
+    try {
+      console.log("Starting browser...");
+      nextBrowser = await puppeteer.launch({
+        args: [
+          "--disable-dev-shm-usage",
+          "--no-sandbox",
+          `--lang=${config.language}`,
+          config.ignoreCertificateErrors && "--ignore-certificate-errors"
+        ].filter((x) => x),
+        defaultViewport: null,
+        timeout: config.browserLaunchTimeout,
+        headless: config.debug !== true
+      });
+
+      console.log(`Visiting '${config.baseUrl}' to login...`);
+      page = await nextBrowser.newPage();
+      await page.goto(config.baseUrl, {
+        timeout: config.renderingTimeout
+      });
+
+      const hassTokens = {
+        hassUrl: config.baseUrl,
+        access_token: config.accessToken,
+        token_type: "Bearer"
+      };
+
+      console.log("Adding authentication entry to browser's local storage...");
+      await page.evaluate(
+        (hassTokens, selectedLanguage, selectedTheme) => {
+          localStorage.setItem("hassTokens", hassTokens);
+          localStorage.setItem("selectedLanguage", selectedLanguage);
+          if (selectedTheme) {
+            localStorage.setItem("selectedTheme", selectedTheme);
+          }
+        },
+        JSON.stringify(hassTokens),
+        JSON.stringify(config.language),
+        config.theme ? JSON.stringify(config.theme) : null
+      );
+
+      await page.close();
+      page = null;
+
+      browser = nextBrowser;
+      browserStartedAt = Date.now();
+      browser.on("disconnected", () => {
+        if (browser === nextBrowser) {
+          browser = null;
+          browserStartedAt = null;
+        }
+      });
+      return browser;
+    } catch (err) {
+      console.error("Browser/HA login failed, will retry on next render tick:", err);
+      if (page) {
+        await page.close().catch((closeErr) => {
+          console.error("Failed to close login page after browser init failure:", closeErr);
+        });
+      }
+      if (nextBrowser) {
+        await nextBrowser.close().catch((closeErr) => {
+          console.error("Failed to close browser after init failure:", closeErr);
+        });
+      }
+      return null;
+    } finally {
+      initInProgress = false;
+    }
+  };
+
+  // --- Now start rendering (HTTP is already serving) ---
+  const startRendering = async () => {
+    await initBrowser();
+    if (config.debug) {
+      console.log(
+        "Debug mode active, will only render once in non-headless model and keep page open"
+      );
+      await safeRender();
+    } else {
+      console.log("Starting first render...");
+      await safeRender();
+      console.log("Starting rendering cronjob...");
+      new CronJob({
+        cronTime: config.cronJob,
+        onTick: () => safeRender(),
+        start: true
+      });
+    }
+  };
+
+  startRendering().catch((err) => {
+    console.error("Rendering startup failed:", err);
+  });
 })();
 
 async function renderAndConvertAsync(browser) {
+  let failedPages = 0;
+
   for (let pageIndex = 0; pageIndex < config.pages.length; pageIndex++) {
-    const pageConfig = config.pages[pageIndex];
-    const pageBatteryStore = batteryStore[pageIndex];
+    try {
+      await renderPageAndConvertAsync(browser, pageIndex);
+    } catch (err) {
+      failedPages++;
+      console.error(`Render failed for page ${pageIndex + 1}:`, err);
+    }
+  }
 
-    const url = `${config.baseUrl}${pageConfig.screenShotUrl}`;
+  if (failedPages > 0) {
+    throw new Error(`${failedPages} render page(s) failed`);
+  }
+}
 
-    const outputPath = pageConfig.outputPath + "." + pageConfig.imageFormat;
+async function renderPageAndConvertAsync(browser, pageIndex) {
+  const pageConfig = config.pages[pageIndex];
+  const pageBatteryStore = batteryStore[pageIndex];
+  const metadata = getOrCreateMetadata(pageIndex);
+  metadata.lastChecked = new Date().toISOString();
+
+  const url = `${config.baseUrl}${pageConfig.screenShotUrl}`;
+  const outputPath = resolveOutputPath(pageConfig);
+  const tempPath = resolveScreenshotTempPath(outputPath);
+  const finalTempPath = resolveFinalTempPath(
+    outputPath,
+    pageConfig.imageFormat
+  );
+
+  try {
     await fsExtra.ensureDir(path.dirname(outputPath));
-
-    const tempPath = outputPath + ".temp";
 
     console.log(`Rendering ${url} to image...`);
     await renderUrlToImageAsync(browser, pageConfig, url, tempPath);
+
     if (!(await fsExtra.pathExists(tempPath))) {
-      console.error(`Screenshot fehlt: ${tempPath}`);
-      return;
-    } 
+      throw new Error(`Screenshot missing: ${tempPath}`);
+    }
+
     console.log(`Converting rendered screenshot of ${url} to grayscale...`);
-    
-    const finalTempPath = outputPath + ".final.temp";
-    await convertImageToKindleCompatiblePngAsync(
-      pageConfig,
-      tempPath,
-      finalTempPath
+
+    await withTimeout(
+      convertImageToKindleCompatiblePngAsync(
+        pageConfig,
+        tempPath,
+        finalTempPath
+      ),
+      config.renderingTimeout,
+      `convert ${url}`
     );
 
-    // Compare with existing image
+    // Compare with existing image — only update if changed
     let hasChanged = true;
     if (await fsExtra.pathExists(outputPath)) {
       const newHash = await getFileHash(finalTempPath);
       const existingHash = await getFileHash(outputPath);
-      
+
       if (newHash && existingHash && newHash === existingHash) {
         hasChanged = false;
         console.log(`Image unchanged for ${url}, skipping update`);
@@ -274,17 +578,15 @@ async function renderAndConvertAsync(browser) {
       console.log(`First render for ${url}, creating image`);
     }
 
-    // Only update the output file if image has changed
     if (hasChanged) {
-      await fsExtra.move(finalTempPath, outputPath, { overwrite: true });
-    } else {
-      await fs.unlink(finalTempPath);
+      await withTimeout(
+        fsExtra.move(finalTempPath, outputPath, { overwrite: true }),
+        config.renderingTimeout,
+        `replace output for ${url}`
+      );
+      metadata.lastModified = new Date().toISOString();
     }
-    
-    // Update metadata JSON
-    await updateMetadataJson(outputPath, hasChanged);
 
-    await fs.unlink(tempPath);
     console.log(`Finished ${url}`);
 
     if (
@@ -298,6 +600,12 @@ async function renderAndConvertAsync(browser) {
         pageConfig.batteryWebHook
       );
     }
+  } catch (err) {
+    console.error(`Render failed for ${url}, keeping previous image:`, err);
+    throw err;
+  } finally {
+    await fsExtra.remove(tempPath).catch(() => {});
+    await fsExtra.remove(finalTempPath).catch(() => {});
   }
 }
 
@@ -331,16 +639,171 @@ function sendBatteryLevelToHomeAssistant(
   req.end();
 }
 
+function updateBatteryStore(pageIndex, pageNumber, batteryLevel, isCharging) {
+  let pageBatteryStore = batteryStore[pageIndex];
+  if (!pageBatteryStore) {
+    pageBatteryStore = batteryStore[pageIndex] = {
+      batteryLevel: null,
+      isCharging: false
+    };
+  }
+
+  if (isNaN(batteryLevel) || batteryLevel < 0 || batteryLevel > 100) {
+    return;
+  }
+
+  if (batteryLevel !== pageBatteryStore.batteryLevel) {
+    pageBatteryStore.batteryLevel = batteryLevel;
+    console.log(`New battery level: ${batteryLevel} for page ${pageNumber}`);
+  }
+
+  if (
+    (isCharging === "Yes" || isCharging === "1") &&
+    pageBatteryStore.isCharging !== true
+  ) {
+    pageBatteryStore.isCharging = true;
+    console.log(`Battery started charging for page ${pageNumber}`);
+  } else if (
+    (isCharging === "No" || isCharging === "0") &&
+    pageBatteryStore.isCharging !== false
+  ) {
+    console.log(`Battery stopped charging for page ${pageNumber}`);
+    pageBatteryStore.isCharging = false;
+  }
+}
+
+function hasTruthyFlag(searchParams, name) {
+  if (!searchParams.has(name)) {
+    return false;
+  }
+
+  const value = String(searchParams.get(name) || "").toLowerCase();
+  return !["0", "false", "no", "off"].includes(value);
+}
+
+function parseRenderTarget(pathname) {
+  if (pathname === "/render") {
+    return { pageNumber: null };
+  }
+
+  const match = pathname.match(/^\/render\/(\d+)$/);
+  if (!match) {
+    return null;
+  }
+
+  const pageNumber = parseInt(match[1], 10);
+  if (!Number.isFinite(pageNumber) || pageNumber < 1) {
+    return null;
+  }
+
+  return { pageNumber };
+}
+
+function getOperationHeaders(renderResult, cacheClearResult) {
+  const headers = {};
+
+  if (renderResult) {
+    headers["X-Render-Status"] = renderResult.status;
+    if (renderResult.reason) {
+      headers["X-Render-Error"] = sanitizeHeaderValue(renderResult.reason);
+    }
+  }
+
+  if (cacheClearResult) {
+    headers["X-Cache-Clear-Status"] = cacheClearResult.status;
+    if (cacheClearResult.reason) {
+      headers["X-Cache-Clear-Error"] = sanitizeHeaderValue(cacheClearResult.reason);
+    }
+  }
+
+  return headers;
+}
+
+function sanitizeHeaderValue(value) {
+  return String(value).replace(/[\r\n]/g, " ").slice(0, 256);
+}
+
+function writeJsonResponse(response, statusCode, payload) {
+  const body = JSON.stringify(sanitizeJsonPayload(payload));
+  response.writeHead(statusCode, {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(body),
+    "Cache-Control": "no-cache"
+  });
+  response.end(body);
+}
+
+function sanitizeJsonPayload(value) {
+  if (value instanceof Error) {
+    return { message: value.message };
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeJsonPayload(item));
+  }
+
+  if (value && typeof value === "object") {
+    const sanitized = {};
+    for (const [key, nestedValue] of Object.entries(value)) {
+      if (key.toLowerCase().includes("stack")) {
+        continue;
+      }
+      sanitized[key] = sanitizeJsonPayload(nestedValue);
+    }
+    return sanitized;
+  }
+
+  return value;
+}
+
+function getOrCreateMetadata(pageIndex) {
+  if (!metadataStore[pageIndex]) {
+    metadataStore[pageIndex] = {
+      lastModified: null,
+      lastChecked: null
+    };
+  }
+
+  return metadataStore[pageIndex];
+}
+
+async function getImageMetadata(pageIndex, outputPath) {
+  const metadata = getOrCreateMetadata(pageIndex);
+  let lastModified = metadata.lastModified;
+
+  if (!lastModified) {
+    try {
+      const outputFileStats = await fs.stat(outputPath);
+      lastModified = outputFileStats.mtime.toISOString();
+    } catch (_) {
+      lastModified = null;
+    }
+  }
+
+  return {
+    lastModified,
+    lastChecked: metadata.lastChecked
+  };
+}
+
 async function renderUrlToImageAsync(browser, pageConfig, url, path) {
   let page;
   try {
-    page = await browser.newPage();
-    await page.emulateMediaFeatures([
-      {
-        name: "prefers-color-scheme",
-        value: `${pageConfig.prefersColorScheme}`
-      }
-    ]);
+    page = await withTimeout(
+      browser.newPage(),
+      config.renderingTimeout,
+      `open browser page for ${url}`
+    );
+    await withTimeout(
+      page.emulateMediaFeatures([
+        {
+          name: "prefers-color-scheme",
+          value: `${pageConfig.prefersColorScheme}`
+        }
+      ]),
+      config.renderingTimeout,
+      `emulate media for ${url}`
+    );
 
     let size = {
       width: Number(pageConfig.renderingScreenSize.width),
@@ -354,44 +817,66 @@ async function renderUrlToImageAsync(browser, pageConfig, url, path) {
       };
     }
 
-    await page.setViewport(size);
+    await withTimeout(
+      page.setViewport(size),
+      config.renderingTimeout,
+      `set viewport for ${url}`
+    );
     const startTime = new Date().valueOf();
+    console.log(`Navigating to ${url}...`);
     await page.goto(url, {
       waitUntil: ["domcontentloaded", "load", "networkidle0"],
       timeout: config.renderingTimeout
     });
 
     const navigateTimespan = new Date().valueOf() - startTime;
+    console.log(`Waiting for home-assistant root on ${url}...`);
     await page.waitForSelector("home-assistant", {
       timeout: Math.max(config.renderingTimeout - navigateTimespan, 1000)
     });
 
-    await page.addStyleTag({
-      content: `
-        body {
-          zoom: ${pageConfig.scaling * 100}%;
-          overflow: hidden;
-        }`
-    });
+    await withTimeout(
+      page.addStyleTag({
+        content: `
+          body {
+            zoom: ${pageConfig.scaling * 100}%;
+            overflow: hidden;
+          }`
+      }),
+      config.renderingTimeout,
+      `add page style for ${url}`
+    );
 
     if (pageConfig.renderingDelay > 0) {
       await page.waitForTimeout(pageConfig.renderingDelay);
     }
-    await page.screenshot({
-      path,
-      type: 'png', // Always use PNG for screenshot
-      captureBeyondViewport: false,
-      clip: {
-        x: 0,
-        y: 0,
-        ...size
-      }
-    });
+    console.log(`Taking screenshot of ${url}...`);
+    await withTimeout(
+      page.screenshot({
+        path,
+        type: 'png', // Always use PNG for screenshot
+        captureBeyondViewport: false,
+        clip: {
+          x: 0,
+          y: 0,
+          ...size
+        }
+      }),
+      config.renderingTimeout,
+      `screenshot ${url}`
+    );
   } catch (e) {
-    console.error("Failed to render", e);
+    console.error(`Failed to render ${url}:`, e);
+    throw e;
   } finally {
-    if (config.debug === false) {
-      await page.close();
+    if (config.debug === false && page) {
+      await withTimeout(
+        page.close(),
+        5000,
+        `close browser page for ${url}`
+      ).catch((err) => {
+        console.error(`Failed to close browser page for ${url}:`, err);
+      });
     }
   }
 }
@@ -404,8 +889,10 @@ function convertImageToKindleCompatiblePngAsync(
   return new Promise((resolve, reject) => {
     let gmInstance = gm(inputPath)
       .options({
-        imageMagick: config.useImageMagick === true
+        imageMagick: config.useImageMagick === true,
+        timeout: config.renderingTimeout
       })
+      .setFormat(getGraphicsMagickFormat(pageConfig.imageFormat))
       .gamma(pageConfig.removeGamma ? 1.0 / 2.2 : 1.0)
       .modulate(100, 100 * pageConfig.saturation)
       .contrast(pageConfig.contrast)
@@ -419,12 +906,10 @@ function convertImageToKindleCompatiblePngAsync(
     if (pageConfig.imageFormat !== 'bmp') {
       gmInstance = gmInstance.quality(100);
     }
-    
-    // Strip metadata to ensure deterministic output
-    // This removes timestamps and other variable metadata that would cause
-    // identical images to have different file hashes
+
+    // Strip metadata to ensure deterministic output for hash comparison
     gmInstance = gmInstance.strip();
-    
+
     gmInstance.write(outputPath, (err) => {
       if (err) {
         reject(err);
@@ -433,4 +918,52 @@ function convertImageToKindleCompatiblePngAsync(
       }
     });
   });
+}
+
+function getRenderJobTimeout() {
+  const pageTimeoutBudget = config.pages.reduce((total, pageConfig) => {
+    return (
+      total +
+      config.renderingTimeout +
+      getNumber(pageConfig.renderingDelay, 0) +
+      30000
+    );
+  }, 0);
+
+  return Math.max(pageTimeoutBudget, config.renderingTimeout + 30000);
+}
+
+function getHealthcheckMaxAge(renderJobTimeout) {
+  const defaultCronInterval = 60000;
+
+  try {
+    const cronTime = new CronTime(config.cronJob);
+    const nextDates = cronTime.sendAt(2);
+    const cronInterval = nextDates[1].valueOf() - nextDates[0].valueOf();
+
+    if (Number.isFinite(cronInterval) && cronInterval > 0) {
+      return cronInterval + renderJobTimeout;
+    }
+  } catch (err) {
+    console.error("Failed to derive healthcheck age from cron, using fallback:", err);
+  }
+
+  return defaultCronInterval + renderJobTimeout;
+}
+
+function getNumber(value, fallbackValue) {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : fallbackValue;
+}
+
+async function closeBrowser(browser, reason) {
+  try {
+    await withTimeout(browser.close(), 5000, `close browser after ${reason}`);
+  } catch (err) {
+    console.error(`Failed to close browser after ${reason}:`, err);
+    const browserProcess = browser.process && browser.process();
+    if (browserProcess) {
+      browserProcess.kill("SIGKILL");
+    }
+  }
 }

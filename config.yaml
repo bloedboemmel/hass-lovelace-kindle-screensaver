@@ -1,5 +1,5 @@
 name: Lovelace Kindle Screensaver
-version: 1.0.15
+version: 1.0.19
 slug: kindle-screensaver
 description: This tool can be used to display a Lovelace view of your Home Assistant instance on a jailbroken Kindle device. It regularly takes a screenshot which can be polled and used as a screensaver image of the online screensaver plugin.
 startup: application
@@ -19,12 +19,14 @@ ports_description:
   5000/tcp: 'Node Webserver hosting rendered image'
 map:
   - media:rw
-watchdog: 'http://[HOST]:[PORT:5000]/'
+watchdog: 'http://[HOST]:[PORT:5000]/health'
 init: false
 options:
   HA_BASE_URL: 'https://your-path-to-home-assistant:8123'
   HA_SCREENSHOT_URL: '/lovelace/0'
   HA_ACCESS_TOKEN: ''
+  HTTP_AUTH_USER: ''
+  HTTP_AUTH_PASSWORD: ''
   LANGUAGE: 'en'
   CRON_JOB: '* * * * *'
   RENDERING_TIMEOUT: '60000'
@@ -32,6 +34,7 @@ options:
   RENDERING_SCREEN_HEIGHT: '800'
   RENDERING_SCREEN_WIDTH: '600'
   BROWSER_LAUNCH_TIMEOUT: '30000'
+  BROWSER_CACHE_TTL_SECONDS: '86400'
   ROTATION: '0'
   SCALING: '1'
   GRAYSCALE_DEPTH: '8'
@@ -47,6 +50,8 @@ schema:
   HA_BASE_URL: "url"
   HA_SCREENSHOT_URL: "str"
   HA_ACCESS_TOKEN: "password"
+  HTTP_AUTH_USER: "str?"
+  HTTP_AUTH_PASSWORD: "password?"
   LANGUAGE: "str?"
   CRON_JOB: "str?"
   RENDERING_TIMEOUT: "int?"
@@ -54,6 +59,7 @@ schema:
   RENDERING_SCREEN_HEIGHT: "int?"
   RENDERING_SCREEN_WIDTH: "int?"
   BROWSER_LAUNCH_TIMEOUT: "int?"
+  BROWSER_CACHE_TTL_SECONDS: "int?"
   ROTATION: "int?"
   SCALING: "float?"
   GRAYSCALE_DEPTH: "int?"

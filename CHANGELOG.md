@@ -1,5 +1,56 @@
 # Changelog
 
+## 1.0.19
+
+### Added
+
+* Add on-demand rendering endpoints for all pages or a single page
+* Add browser cache reset support with an optional browser cache TTL
+* Add conditional image responses using `ETag` and `Last-Modified` validators
+* Add render status headers for refresh requests
+
+### Fixed
+
+* Keep page-specific refreshes from masking stale all-page render health
+
+## 1.0.18
+
+### Added
+
+* Add a render health endpoint and wire Docker/Home Assistant health checks to detect stale renders
+
+### Fixed
+
+* Recover from stale render locks by bounding render jobs and restarting Chromium after render timeouts
+* Add step-level render, screenshot, conversion, and file replacement timeouts with clearer error logging
+
+## 1.0.17
+
+### Added
+
+* Add Home Assistant add-on and Docker Compose configuration entries for optional HTTP Basic Auth
+* Add Vitest coverage for output path and image format handling
+
+### Fixed
+
+* Preserve configured `jpeg` and `bmp` output formats when writing converted temp files
+* Force GraphicsMagick to write the configured output format instead of inferring PNG from temp paths
+
+## 1.0.16
+
+### Added
+
+* Add optional HTTP Basic Auth support for the rendered image endpoint
+* Add image change detection with ETag/HEAD support to reduce unnecessary Kindle image downloads
+* Add `HA_THEME` to explicitly select a Home Assistant theme
+* Add `.env` support for local configuration
+
+### Fixed
+
+* Validate required Home Assistant configuration earlier to avoid first-run `ERR_NAME_NOT_RESOLVED` failures
+* Keep the HTTP server available when browser initialization or rendering fails, and retry browser startup after failures
+* Update deprecated Home Assistant theme CSS variables for Home Assistant 2025.5+ compatibility
+
 ## Unreleased
 
 ### Changed
