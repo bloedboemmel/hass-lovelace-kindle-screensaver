@@ -81,12 +81,14 @@ class RenderCoordinator {
       return { status: "ok" };
     } catch (err) {
       this.logger.error(`${label} failed but server stays alive:`, err);
+      let reason = "render_failed";
       if (timedOut || err instanceof OperationTimeoutError) {
+        reason = "timeout";
         await this.closeBrowser(`${label} timeout`);
       }
       return {
         status: "failed",
-        error: err && err.message ? err.message : String(err)
+        reason
       };
     } finally {
       this.renderInProgress = false;

@@ -119,7 +119,7 @@ describe("render coordinator", () => {
     );
 
     expect(result.status).toBe("failed");
-    expect(result.error).toContain("stuck render timed out");
+    expect(result.reason).toBe("timeout");
     expect(closeBrowser).toHaveBeenCalledWith("stuck render timeout");
   });
 });

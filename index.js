@@ -704,15 +704,15 @@ function getOperationHeaders(renderResult, cacheClearResult) {
 
   if (renderResult) {
     headers["X-Render-Status"] = renderResult.status;
-    if (renderResult.error) {
-      headers["X-Render-Error"] = sanitizeHeaderValue(renderResult.error);
+    if (renderResult.reason) {
+      headers["X-Render-Error"] = sanitizeHeaderValue(renderResult.reason);
     }
   }
 
   if (cacheClearResult) {
     headers["X-Cache-Clear-Status"] = cacheClearResult.status;
-    if (cacheClearResult.error) {
-      headers["X-Cache-Clear-Error"] = sanitizeHeaderValue(cacheClearResult.error);
+    if (cacheClearResult.reason) {
+      headers["X-Cache-Clear-Error"] = sanitizeHeaderValue(cacheClearResult.reason);
     }
   }
 
@@ -724,13 +724,36 @@ function sanitizeHeaderValue(value) {
 }
 
 function writeJsonResponse(response, statusCode, payload) {
-  const body = JSON.stringify(payload);
+  const body = JSON.stringify(sanitizeJsonPayload(payload));
   response.writeHead(statusCode, {
     "Content-Type": "application/json",
     "Content-Length": Buffer.byteLength(body),
     "Cache-Control": "no-cache"
   });
   response.end(body);
+}
+
+function sanitizeJsonPayload(value) {
+  if (value instanceof Error) {
+    return { message: value.message };
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeJsonPayload(item));
+  }
+
+  if (value && typeof value === "object") {
+    const sanitized = {};
+    for (const [key, nestedValue] of Object.entries(value)) {
+      if (key.toLowerCase().includes("stack")) {
+        continue;
+      }
+      sanitized[key] = sanitizeJsonPayload(nestedValue);
+    }
+    return sanitized;
+  }
+
+  return value;
 }
 
 function getOrCreateMetadata(pageIndex) {
