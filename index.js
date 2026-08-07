@@ -24,6 +24,11 @@ const { RenderCoordinator } = require("./render-coordinator");
 // keep state of current battery level and whether the device is charging
 const batteryStore = {};
 const metadataStore = {};
+const hasDisplayServer = Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+const browserLaunchMode = {
+  headless: config.debug !== true || !hasDisplayServer,
+  keepDebugPageOpen: config.debug === true && hasDisplayServer
+};
 
 // Helper function to calculate file hash
 async function getFileHash(filePath) {
@@ -90,6 +95,11 @@ async function getFileHash(filePath) {
   // This ensures the Kindle always gets the last good image,
   // even if HA is temporarily unreachable during startup.
   console.log("Starting HTTP server...");
+  if (config.debug === true && !hasDisplayServer) {
+    console.warn(
+      "DEBUG=true requested but no display server is available; forcing headless mode."
+    );
+  }
 
   let initInProgress = false;
   let browser = null;
@@ -421,11 +431,12 @@ async function getFileHash(filePath) {
           "--disable-dev-shm-usage",
           "--no-sandbox",
           `--lang=${config.language}`,
+          browserLaunchMode.headless && "--headless",
           config.ignoreCertificateErrors && "--ignore-certificate-errors"
         ].filter((x) => x),
         defaultViewport: null,
         timeout: config.browserLaunchTimeout,
-        headless: config.debug !== true
+        headless: browserLaunchMode.headless
       });
 
       console.log(`Visiting '${config.baseUrl}' to login...`);
@@ -487,10 +498,13 @@ async function getFileHash(filePath) {
   // --- Now start rendering (HTTP is already serving) ---
   const startRendering = async () => {
     await initBrowser();
-    if (config.debug) {
+    if (browserLaunchMode.keepDebugPageOpen) {
       console.log(
         "Debug mode active, will only render once in non-headless model and keep page open"
       );
+      await safeRender();
+    } else if (config.debug) {
+      console.log("Debug mode active, rendering once in headless mode");
       await safeRender();
     } else {
       console.log("Starting first render...");
@@ -869,7 +883,7 @@ async function renderUrlToImageAsync(browser, pageConfig, url, path) {
     console.error(`Failed to render ${url}:`, e);
     throw e;
   } finally {
-    if (config.debug === false && page) {
+    if (!browserLaunchMode.keepDebugPageOpen && page) {
       await withTimeout(
         page.close(),
         5000,
