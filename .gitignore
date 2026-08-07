@@ -5,6 +5,7 @@ docker-compose.*.yml
 cover.png
 .devcontainer/
 .DS_Store
+.env
 output/
 *.png.json
 *.jpeg.json

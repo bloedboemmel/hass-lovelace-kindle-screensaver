@@ -4,14 +4,20 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "vitest run"
   },
   "author": "sibbl",
   "license": "MIT",
   "dependencies": {
     "cron": "^1.8.2",
+    "dotenv": "^16.6.1",
     "fs-extra": "^10.0.0",
     "gm": "^1.23.1",
     "puppeteer": "^11.0.0"
+  },
+  "devDependencies": {
+    "vite": "^4.5.14",
+    "vitest": "^0.34.6"
   }
 }

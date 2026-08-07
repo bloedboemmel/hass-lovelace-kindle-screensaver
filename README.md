@@ -14,9 +14,31 @@ If you're looking for a way to render your own HTML, see my other project [hass-
 
 This tool regularly takes a screenshot of a specific page of your home assistant setup. It converts it into the PNG/JPEG grayscale format which Kindles can display.
 
-**Energy-Efficient Image Updates:** The tool intelligently compares each new screenshot with the previous one and only updates the image file when changes are detected. This helps save energy on e-ink displays by avoiding unnecessary screen refreshes. A JSON metadata file is also generated to track when images were last modified and checked.
-
 Using my [own Kindle 4 setup guide](https://github.com/sibbl/hass-lovelace-kindle-4) or the [online screensaver extension](https://www.mobileread.com/forums/showthread.php?t=236104) for any jailbroken Kindle, this image can be regularly polled from your device so you can use it as a weather station, a display for next public transport departures etc.
+
+### Energy-efficient image updates
+
+The tool compares each new screenshot with the previous one and only updates the served image when changes are detected. This keeps the `Last-Modified` timestamp and `ETag` header stable, allowing e-ink clients to skip unnecessary downloads and screen refreshes.
+
+You can use a lightweight `HEAD` request to check for changes without downloading the image:
+
+```bash
+curl -I http://localhost:5000/
+```
+
+Compare the returned `ETag` or `Last-Modified` with your last known value — only `GET` the image if it changed.
+Conditional `GET` and `HEAD` requests using `If-None-Match` or `If-Modified-Since` return `304 Not Modified` when the image has not changed.
+
+You can trigger an on-demand render for a single image before downloading it:
+
+```bash
+curl -v http://localhost:5000/?refresh=1
+curl -v http://localhost:5000/2?refresh=1
+```
+
+The response includes `X-Render-Status`. If rendering fails, the server keeps serving the previous image when one exists and returns `X-Render-Status: failed`.
+
+For API clients, use `POST /render` to render all pages, `POST /render/2` to render one page, and `POST /cache/clear` to restart Chromium and clear browser-side frontend caches. Kindle-compatible image requests can combine cache clearing and rendering with `?clearCache=1&refresh=1`.
 
 ## Usage
 
@@ -31,7 +53,7 @@ You can then access the image by doing a simple GET request to e.g. `http://loca
 
 ### Checking for Image Updates (JSON Metadata)
 
-To save energy on e-ink displays, you can check if an image has been updated before downloading it. The tool provides a JSON metadata endpoint for each page:
+For compatibility with existing clients, metadata endpoints are available for each page:
 
 - `http://localhost:5000/.json` - Metadata for page 1
 - `http://localhost:5000/2.json` - Metadata for page 2
@@ -45,10 +67,12 @@ The JSON response contains:
 }
 ```
 
-- `lastModified`: Timestamp when the image was last changed (null if never changed)
-- `lastChecked`: Timestamp when the screenshot was last taken
+- `lastModified`: Timestamp when the rendered image was last changed (`null` if no image exists yet)
+- `lastChecked`: Timestamp when the page was last checked for rendering (`null` if never checked)
 
-Your e-ink display can check this endpoint before downloading the image. If `lastModified` hasn't changed since the last check, skip downloading the image to save energy and bandwidth.
+## Troubleshooting
+
+If you encounter errors like `ERR_NAME_NOT_RESOLVED` or configuration issues, please see the [TROUBLESHOOTING.md](TROUBLESHOOTING.md) guide for detailed help.
 
 Home Assistant related stuff:
 
@@ -58,6 +82,9 @@ Home Assistant related stuff:
 | `HA_SCREENSHOT_URL`       | `/lovelace/screensaver?kiosk`         | yes      | yes      | Relative URL to take screenshot of (btw, the `?kiosk` parameter hides the nav bar using the [kiosk mode](https://github.com/NemesisRE/kiosk-mode) project)                                           |
 | `HA_ACCESS_TOKEN`         | `eyJ0...`                             | yes      | no       | Long-lived access token from Home Assistant, see [official docs](https://developers.home-assistant.io/docs/auth_api/#long-lived-access-token)                                                        |
 | `HA_BATTERY_WEBHOOK`      | `set_kindle_battery_level`            | no       | yes      | Webhook definied in HA which receives `batteryLevel` (number between 0-100) and `isCharging` (boolean) as JSON                                                                                       |
+| `HA_THEME`                | `eink`                                | no       | no       | Name of the HA theme to use for rendering. Must be installed in your HA instance. When not set, HA's default theme is used.                                                                           |
+| `HTTP_AUTH_USER`          | `admin`                               | no       | no       | Username for optional HTTP basic authentication on the image server. Requires `HTTP_AUTH_PASSWORD` to enable authentication.                                                                          |
+| `HTTP_AUTH_PASSWORD`      | `secret`                              | no       | no       | Password for optional HTTP basic authentication on the image server. Requires `HTTP_AUTH_USER` to enable authentication.                                                                              |
 | `LANGUAGE`                | `en`                                  | no       | no       | Language to set in browser and home assistant                                                                                                                                                        |
 | `PREFERS_COLOR_SCHEME`    | `light`                               | no       | no       | Enable browser dark mode, use `light` or `dark`.                                                                                                                                                     |
 | `CRON_JOB`                | `* * * * *`                           | no       | no       | How often to take screenshot                                                                                                                                                                         |
@@ -66,6 +93,7 @@ Home Assistant related stuff:
 | `RENDERING_SCREEN_HEIGHT` | `800`                                 | no       | yes      | Height of your kindle screen resolution                                                                                                                                                              |
 | `RENDERING_SCREEN_WIDTH`  | `600`                                 | no       | yes      | Width of your kindle screen resolution                                                                                                                                                               |
 | `BROWSER_LAUNCH_TIMEOUT`  | `30000`                               | no       | no       | Timeout for browser launch, helpful if your HASS instance is slow                                                                                                                                    |
+| `BROWSER_CACHE_TTL_SECONDS` | `86400`                             | no       | no       | Restart Chromium before rendering after this many seconds to clear browser-side Home Assistant frontend caches. Set to `0` to disable.                                                               |
 | `ROTATION`                | `0`                                   | no       | yes      | Rotation of image in degrees, e.g. use 90 or 270 to render in landscape                                                                                                                              |
 | `SCALING`                 | `1`                                   | no       | yes      | Scaling factor, e.g. `1.5` to zoom in or `0.75` to zoom out                                                                                                                                          |
 | `GRAYSCALE_DEPTH`         | `8`                                   | no       | yes      | Grayscale bit depth your kindle supports                                                                                                                                                             |
@@ -141,45 +169,3 @@ Some advanced variables for local usage which shouldn't be necessary when using 
 - `PORT=5000` (port of server, which returns the last image)
 - `USE_IMAGE_MAGICK=false` (use ImageMagick instead of GraphicsMagick)
 - `UNSAFE_IGNORE_CERTIFICATE_ERRORS=true` (ignore certificate errors of e.g. self-signed certificates at your own risk)
-
-## Development
-
-### Publishing to Custom Registry
-
-This repository includes a GitHub Actions workflow (`custom-registry.yml`) that allows you to push Docker images to your own container registry. This is useful if you want to maintain your own fork with custom modifications.
-
-#### Setup
-
-To use the custom registry workflow, you need to configure the following repository secrets in your GitHub repository settings:
-
-**For Docker Hub:**
-- `CUSTOM_REGISTRY_URL` - Leave empty or set to `docker.io`
-- `CUSTOM_REGISTRY_USERNAME` - Your Docker Hub username
-- `CUSTOM_REGISTRY_TOKEN` - Your Docker Hub access token
-- `CUSTOM_REGISTRY_PREFIX` - Your Docker Hub username (e.g., `yourusername`)
-
-**For GitHub Container Registry (GHCR):**
-- `CUSTOM_REGISTRY_URL` - Set to `ghcr.io`
-- `CUSTOM_REGISTRY_USERNAME` - Your GitHub username
-- `CUSTOM_REGISTRY_TOKEN` - GitHub Personal Access Token with `write:packages` permission
-- `CUSTOM_REGISTRY_PREFIX` - Set to `ghcr.io/yourusername` (lowercase)
-
-**For other registries (e.g., AWS ECR, Google Container Registry):**
-- `CUSTOM_REGISTRY_URL` - Your registry URL (e.g., `123456789.dkr.ecr.us-east-1.amazonaws.com`)
-- `CUSTOM_REGISTRY_USERNAME` - Registry username
-- `CUSTOM_REGISTRY_TOKEN` - Registry access token/password
-- `CUSTOM_REGISTRY_PREFIX` - Your registry prefix (e.g., `123456789.dkr.ecr.us-east-1.amazonaws.com/yourname`)
-
-#### Triggering the Workflow
-
-The workflow runs automatically when you push a tag matching the pattern `v*.*.*` (e.g., `v1.0.0`). You can also trigger it manually from the Actions tab in GitHub.
-
-The workflow builds and pushes the following images:
-- Main application image for multiple architectures (amd64, arm/v7, arm64)
-- Home Assistant Addon images for amd64, aarch64, and armv7
-
-Example images pushed to your registry:
-- `yourusername/hass-lovelace-kindle-screensaver:latest`
-- `yourusername/hass-lovelace-kindle-screensaver:1.0.15`
-- `yourusername/hass-lovelace-kindle-screensaver-ha-addon-amd64:latest`
-- And more...
