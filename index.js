@@ -507,14 +507,27 @@ async function getFileHash(filePath) {
       console.log("Debug mode active, rendering once in headless mode");
       await safeRender();
     } else {
+      console.log("Starting rendering cronjob...");
+      try {
+        new CronJob({
+          cronTime: config.cronJob,
+          onTick: () => safeRender(),
+          start: true
+        });
+      } catch (err) {
+        console.error(
+          `Invalid CRON_JOB '${config.cronJob}', falling back to '* * * * *':`,
+          err
+        );
+        new CronJob({
+          cronTime: "* * * * *",
+          onTick: () => safeRender(),
+          start: true
+        });
+      }
+
       console.log("Starting first render...");
       await safeRender();
-      console.log("Starting rendering cronjob...");
-      new CronJob({
-        cronTime: config.cronJob,
-        onTick: () => safeRender(),
-        start: true
-      });
     }
   };
 
